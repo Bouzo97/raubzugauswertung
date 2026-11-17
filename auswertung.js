@@ -113,31 +113,63 @@
     return { rows, links };
   }
 
-  async function ladeRangliste(mode, type, label, fortschritt) {
+  async function ladeRangliste(mode, type, label, fortschritt, diag) {
     const basis = `${location.origin}/game.php?village=${gd.village.id}&screen=ranking&mode=${mode}&type=${type}`;
     const werte = new Map();
-    const queue = [{ key: 0, url: basis }];
-    const gesehen = new Set([0]);
-    let n = 0, pager = false, schritt = 0;
-    while (queue.length && n < CFG.maxSeiten) {
-      queue.sort((a, b) => a.key - b.key);
-      const { key, url } = queue.shift();
+    const d = { label, mode, type, seiten: [], pager: false, param: null, gesamt: 0 };
+    diag.push(d);
+    let n = 0;
+
+    // Lädt eine Seite, trägt die Werte ein und meldet Zeilen, neue Spieler und Pager-Links zurück
+    async function seite(url) {
       const html = await holeText(url);
       n++;
       const { rows, links } = parseRangliste(html, mode, type);
-      if (n === 1) {
-        if (!rows.length) throw new Error(`Keine Ranglisten-Zeilen erkannt (${label}). URL: ${url}`);
-        schritt = rows.length;
-      }
+      const vorher = werte.size;
       rows.forEach((r) => { if (!werte.has(r.id) || werte.get(r.id) < r.wert) werte.set(r.id, r.wert); });
-      links.forEach((l) => { pager = true; if (!gesehen.has(l.key)) { gesehen.add(l.key); queue.push(l); } });
-      if (!pager && schritt > 0 && rows.length >= schritt) {
-        const nk = key + schritt;
-        if (!gesehen.has(nk)) { gesehen.add(nk); queue.push({ key: nk, url: basis + '&from=' + nk }); }
-      }
+      const neu = werte.size - vorher;
+      d.seiten.push({ url: url.replace(location.origin, '').replace(/village=\d+&/, ''), zeilen: rows.length, neu, links: links.length });
       fortschritt(`${label}: Seite ${n} geladen (${werte.size} Spieler)…`);
       await sleep(CFG.pauseMs);
+      return { rows, links, neu };
     }
+
+    const erste = await seite(basis);
+    if (!erste.rows.length) throw new Error(`Keine Ranglisten-Zeilen erkannt (${label}). URL: ${basis}`);
+    const schritt = erste.rows.length;
+
+    // a) Pager-Links der Seite verfolgen
+    const queue = [];
+    const gesehen = new Set([0]);
+    const einreihen = (links) => links.forEach((l) => { d.pager = true; if (!gesehen.has(l.key)) { gesehen.add(l.key); queue.push(l); } });
+    einreihen(erste.links);
+    while (queue.length && n < CFG.maxSeiten) {
+      queue.sort((a, b) => a.key - b.key);
+      const { url } = queue.shift();
+      const s2 = await seite(url);
+      einreihen(s2.links);
+    }
+
+    // b) Keine Pager-Links gefunden: gängige Parameter ausprobieren (Abbruch, sobald eine Seite nichts Neues bringt)
+    if (!d.pager) {
+      const kandidaten = [
+        ['from', (k) => k * schritt],
+        ['offset', (k) => k * schritt],
+        ['page', (k) => k],
+        ['page', (k) => k + 1],
+      ];
+      for (const [p, f] of kandidaten) {
+        const s1 = await seite(`${basis}&${p}=${f(1)}`);
+        if (s1.neu === 0) continue;
+        d.param = p;
+        for (let k = 2; n < CFG.maxSeiten; k++) {
+          const t = await seite(`${basis}&${p}=${f(k)}`);
+          if (t.neu === 0) break;
+        }
+        break;
+      }
+    }
+    d.gesamt = werte.size;
     return werte;
   }
 
@@ -178,8 +210,9 @@
       if (!members.length) throw new Error('Keine Spieler zu den eingegebenen Tags gefunden.');
 
       const rm = modus === 'rekord' ? 'in_a_day' : 'kill_player';
-      const plund = await ladeRangliste(rm, CFG.typPlundern, 'Plündern', setStatus);
-      const raub = await ladeRangliste(rm, CFG.typRaubzug, 'Raubzüge', setStatus);
+      const diag = [];
+      const plund = await ladeRangliste(rm, CFG.typPlundern, 'Plündern', setStatus, diag);
+      const raub = await ladeRangliste(rm, CFG.typRaubzug, 'Raubzüge', setStatus, diag);
 
       const jetzt = Date.now();
       const hist = ladeHist();
@@ -220,7 +253,10 @@
         else if (ohne) hinweise.push(`${ohne} Spieler hatten noch keine Basis-Messung (Anzeige "–").`);
         if (rows.some((r) => r.ungenau)) hinweise.push('Bei Spielern mit Basis von gestern ist der Zeitraum länger als seit 0 Uhr (siehe Spalte "Seit").');
       }
-      ergebnis = { rows, modus, hinweise };
+      diag[0].treffer = members.filter((p) => plund.has(p.id)).length;
+      diag[1].treffer = members.filter((p) => raub.has(p.id)).length;
+      diag.forEach((x) => { x.mitglieder = members.length; });
+      ergebnis = { rows, modus, hinweise, diag };
       zeigeErgebnis();
     } catch (e) {
       console.error(e);
@@ -271,10 +307,12 @@
     const heute = ergebnis.modus === 'heute';
     const ok = rows.filter((r) => r.quote != null && r.quote >= ziel).length;
     const bewertet = rows.filter((r) => r.quote != null).length;
-    q('#rz-summary').innerHTML =
-      `<b>${ok} von ${bewertet}</b> Spielern erreichen mindestens <b>${ziel} %</b> der Raubzugsquote ` +
-      `(Modus: ${heute ? 'tagesaktuell' : 'Rekordwert (Tagesbester)'}).` +
-      (ergebnis.hinweise.length ? '<br><span style="color:#8a5a00">' + ergebnis.hinweise.map(esc).join('<br>') + '</span>' : '');
+    const hinweisHtml = ergebnis.hinweise.length ? '<span style="color:#8a5a00">' + ergebnis.hinweise.map(esc).join('<br>') + '</span>' : '';
+    q('#rz-summary').innerHTML = (heute && bewertet === 0)
+      ? '<b>Noch keine Auswertung möglich.</b><br>' + hinweisHtml
+      : `<b>${ok} von ${bewertet}</b> Spielern erreichen mindestens <b>${ziel} %</b> der Raubzugsquote ` +
+        `(Modus: ${heute ? 'tagesaktuell' : 'Rekordwert (Tagesbester)'}).` + (hinweisHtml ? '<br>' + hinweisHtml : '');
+    q('#rz-diag').value = diagText();
     const cols = heute ? [...SPALTEN, { k: 'seit', t: 'Seit' }] : SPALTEN;
     let h = '<table class="rz-tab"><thead><tr><th>#</th>' +
       cols.map((c) => `<th data-k="${c.k}" style="cursor:pointer">${c.t}${sort.k === c.k ? (sort.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr></thead><tbody>';
@@ -290,6 +328,14 @@
     q('#rz-table').querySelectorAll('th[data-k]').forEach((th) => {
       th.onclick = () => { const k = th.dataset.k; sort = { k, dir: sort.k === k ? -sort.dir : (k === 'name' || k === 'tag' ? 1 : -1) }; renderTabelle(); };
     });
+  }
+
+  function diagText() {
+    return (ergebnis.diag || []).map((d) =>
+      `${d.label} (mode=${d.mode}, type=${d.type}): ${d.seiten.length} Seite(n), ${d.gesamt} Spieler eingelesen, ` +
+      `Treffer im Stamm ${d.treffer}/${d.mitglieder}, Pager-Links: ${d.pager ? 'ja' : 'nein'}${d.param ? ', Parameter: ' + d.param : ''}\n` +
+      d.seiten.slice(0, 12).map((x) => `  ${x.url} -> Zeilen ${x.zeilen}, neu ${x.neu}, Links ${x.links}`).join('\n')
+    ).join('\n');
   }
 
   function bbCode() {
@@ -380,6 +426,7 @@
         <div id="rz-summary" style="margin:6px 0"></div>
         <div id="rz-bbwrap" style="display:none"><textarea id="rz-bb" rows="8" readonly></textarea><button id="rz-copy">In Zwischenablage kopieren</button></div>
         <div id="rz-table"></div>
+        <details style="margin-top:8px"><summary>Diagnose (bei Problemen kopieren und mir schicken)</summary><textarea id="rz-diag" rows="9" readonly></textarea></details>
         <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) wird aus Dörferzahl und Punkten pro Dorf geschätzt (Sättigungsmodell); bei „tagesaktuell“ wird es auf den gemessenen Zeitraum umgerechnet.</p>
       </div>`;
     document.body.appendChild(box);
