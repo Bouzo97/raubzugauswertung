@@ -369,10 +369,12 @@
     const heute = ergebnis.modus === 'heute';
     const rows = sortiert();
     let t = `[b]Raubzug-Auswertung Welt ${gd.world}[/b] – ${heute ? 'tagesaktuell' : 'Rekordwerte (Tagesbester)'}, Zielquote ${ziel} %\n`;
-    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Punkte[||]Dörfer[||]Raubzüge[||]Rekord am[||]Soll[||]Quote[/**]\n';
+    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Punkte[||]Raubzüge[||]Soll[||]Quote[||]Rekord am[/**]\n';
     rows.forEach((r, i) => {
       const c = farbe[klasse(r, ziel)];
-      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.punkte)}[|]${fmt(r.doerfer)}[|]${fmt(r.raubzug)}[|]${datumAbs(r.datum)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color]\n`;
+      const alt = alterInTagen(r.datum);
+      const dc = alt == null ? farbe[''] : alt > 14 ? farbe['rz-bad'] : alt > 7 ? farbe['rz-mid'] : farbe['rz-ok'];   // gleiche Farben wie die Quote: grün bis 7 Tage, gelb/orange über 7, rot über 14
+      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.punkte)}[|]${fmt(r.raubzug)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color][|][color=${dc}]${datumAbs(r.datum)}[/color]\n`;
     });
     return t + '[/table]';
   }
