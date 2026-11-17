@@ -2,7 +2,7 @@
 // @name         Raubzug-Auswertung (Die Stämme)
 // @namespace    die-staemme-raubzug-auswertung
 // @version      1.0.0
-// @description  Wertet erbeutete Rohstoffe (Plündern & Raubzüge) pro Stamm aus der Rangliste aus, inkl. Raubzugsquote, BB-Code und CSV
+// @description  Wertet gesammelte Rohstoffe (Raubzüge) pro Stamm aus der Rangliste aus, inkl. Raubzugsquote, BB-Code und CSV
 // @match        https://*.die-staemme.de/game.php*
 // @grant        none
 // ==/UserScript==
@@ -28,8 +28,7 @@
     pauseMs: 250,      // Pause zwischen zwei Seitenaufrufen
     maxSeiten: 400,    // Sicherheitsgrenze pro Rangliste
     // Ranglisten-Typen (falls die Welt andere Namen nutzt, hier anpassen):
-    typPlundern: 'loot_res',  // Rohstoffe durch Farmen von Dörfern
-    typRaubzug: 'scavenge',   // Rohstoffe durch Raubzüge
+    typRaubzug: 'scavenge',   // Gesammelte Rohstoffe (Raubzüge)
     // Soll-Modell für Raubzüge (siehe sollProTag):
     sollMax: 44000,    // feste Formel / Rückfallwert: 100 %-Beute pro Dorf und Tag bei großen Dörfern
     sollP0: 2000,      // Kurvenform: ab ca. 4.000 Punkten pro Dorf ist ein Dorf fast voll ausgelastet
@@ -218,7 +217,6 @@
       if (!members.length) throw new Error('Keine Spieler zu den eingegebenen Tags gefunden.');
 
       const diag = [];
-      const plund = await ladeRangliste('in_a_day', CFG.typPlundern, 'Plündern', setStatus, diag);
       const raub = await ladeRangliste('in_a_day', CFG.typRaubzug, 'Raubzüge', setStatus, diag);
 
       // Messlatte (C): Welt-Eichung (höchstens eichTage alt) oder feste Formel
@@ -256,12 +254,12 @@
         return istHeute(e.datum) ? { v: e.wert, datum: e.datum } : { v: null, datum: e.datum };
       };
       const rows = members.map((p) => {
-        const l = wertVon(plund, p.id), r2 = wertVon(raub, p.id);
+        const r2 = wertVon(raub, p.id);
         const sollTag = sollProTag(p.punkte, p.doerfer, C);
         const soll = heute ? sollTag * stundenHeute / 24 : sollTag;
         const r = {
           id: p.id, name: p.name, tag: tagVon[p.ally], punkte: p.punkte, doerfer: p.doerfer,
-          plunder: l.v, raubzug: r2.v, gesamt: l.v != null && r2.v != null ? l.v + r2.v : null,
+          raubzug: r2.v,
           soll, datum: r2.datum, quote: null,
         };
         r.quote = soll > 0 && r2.v != null ? (r2.v / soll) * 100 : null;
@@ -273,8 +271,7 @@
         hinweise.push('Tagesaktuell: Das Spiel liefert nur den Tagesrekord, keinen Wert "seit 0 Uhr". Exakt sind daher nur Spieler, deren Rekord von heute ist (oder die noch nie etwas erbeutet haben).');
         if (unbekannt) hinweise.push(`${unbekannt} von ${rows.length} Spielern haben heute keinen neuen Rekord gesetzt: Ihr Tageswert ist nicht ablesbar (Anzeige "–"), er liegt höchstens beim Rekordwert.`);
       }
-      diag[0].treffer = members.filter((p) => plund.has(p.id)).length;
-      diag[1].treffer = members.filter((p) => raub.has(p.id)).length;
+      diag[0].treffer = members.filter((p) => raub.has(p.id)).length;
       diag.forEach((x) => { x.mitglieder = members.length; });
       ergebnis = { rows, modus, hinweise, diag, eichText };
       zeigeErgebnis();
@@ -290,8 +287,7 @@
   const SPALTEN = [
     { k: 'name', t: 'Spieler' }, { k: 'tag', t: 'Stamm' },
     { k: 'punkte', t: 'Punkte', n: 1 }, { k: 'doerfer', t: 'Dörfer', n: 1 },
-    { k: 'plunder', t: 'Plündern (Dörfer)', n: 1 }, { k: 'raubzug', t: 'Raubzüge', n: 1 },
-    { k: 'gesamt', t: 'Gesamt', n: 1 }, { k: 'soll', t: 'Soll Raubzug', n: 1 },
+    { k: 'raubzug', t: 'Raubzüge', n: 1 }, { k: 'soll', t: 'Soll Raubzug', n: 1 },
     { k: 'quote', t: 'Quote', n: 1 },
   ];
 
@@ -340,7 +336,7 @@
       const cls = klasse(r, ziel);
       h += `<tr class="${cls}"><td>${i + 1}</td><td>${esc(r.name)}</td><td>${esc(r.tag)}</td>` +
         `<td class="n">${fmt(r.punkte)}</td><td class="n">${fmt(r.doerfer)}</td>` +
-        `<td class="n">${fmt(r.plunder)}</td><td class="n">${fmt(r.raubzug)}</td><td class="n">${fmt(r.gesamt)}</td>` +
+        `<td class="n">${fmt(r.raubzug)}</td>` +
         `<td class="n">${fmt(r.soll)}</td><td class="n"><b>${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}</b></td>` +
         (heute ? '' : `<td>${esc(r.datum || '–')}</td>`) + '</tr>';
     });
@@ -365,10 +361,10 @@
     const heute = ergebnis.modus === 'heute';
     const rows = sortiert();
     let t = `[b]Raubzug-Auswertung Welt ${gd.world}[/b] – ${heute ? 'tagesaktuell' : 'Rekordwerte (Tagesbester)'}, Zielquote ${ziel} %\n`;
-    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Dörfer[||]Plündern[||]Raubzüge[||]Soll[||]Quote[/**]\n';
+    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Dörfer[||]Raubzüge[||]Soll[||]Quote[/**]\n';
     rows.forEach((r, i) => {
       const c = farbe[klasse(r, ziel)];
-      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.doerfer)}[|]${fmt(r.plunder)}[|]${fmt(r.raubzug)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color]\n`;
+      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.doerfer)}[|]${fmt(r.raubzug)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color]\n`;
     });
     return t + '[/table]';
   }
@@ -377,11 +373,11 @@
     const heute = ergebnis.modus === 'heute';
     const z = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
     const nz = (v) => (v == null ? '' : String(Math.round(v)));
-    const kopf = ['Rang', 'Spieler', 'Stamm', 'Punkte', 'Doerfer', 'Plundern', 'Raubzuege', 'Gesamt', 'Soll_Raubzug', 'Quote_Prozent'];
+    const kopf = ['Rang', 'Spieler', 'Stamm', 'Punkte', 'Doerfer', 'Raubzuege', 'Soll_Raubzug', 'Quote_Prozent'];
     if (!heute) kopf.push('Raubzug_Rekord_am');
     const lines = [kopf.map(z).join(';')];
     sortiert().forEach((r, i) => {
-      const l = [i + 1, r.name, r.tag, nz(r.punkte), nz(r.doerfer), nz(r.plunder), nz(r.raubzug), nz(r.gesamt), nz(r.soll), r.quote == null ? '' : r.quote.toFixed(1).replace('.', ',')];
+      const l = [i + 1, r.name, r.tag, nz(r.punkte), nz(r.doerfer), nz(r.raubzug), nz(r.soll), r.quote == null ? '' : r.quote.toFixed(1).replace('.', ',')];
       if (!heute) l.push(r.datum || '');
       lines.push(l.map(z).join(';'));
     });
