@@ -31,9 +31,16 @@
     typPlundern: 'loot_res',  // Rohstoffe durch Farmen von Dörfern
     typRaubzug: 'scavenge',   // Rohstoffe durch Raubzüge
     // Soll-Modell für Raubzüge (siehe sollProTag):
-    sollMax: 45000,    // max. sinnvolle Raubzug-Beute pro Dorf und Tag bei sehr großen Dörfern
-    sollP0: 3500,      // Dorfpunkte, ab denen das Dorf "gut" ausgelastet ist
-    sollFaktor: 1,     // globaler Faktor, z. B. 1.2 bei schnelleren Welten
+    sollMax: 44000,    // feste Formel / Rückfallwert: 100 %-Beute pro Dorf und Tag bei großen Dörfern
+    sollP0: 2000,      // Kurvenform: ab ca. 4.000 Punkten pro Dorf ist ein Dorf fast voll ausgelastet
+    // Welt-Eichung: Median der Top-100-Rekorde (nur junge Rekorde) soll genau eichZiel % ergeben
+    eichTop: 100,        // Plätze der Rekordliste, die als Vergleich dienen
+    eichMaxAlter: 14,    // nur Rekorde der letzten X Tage (alte Rekorde passen nicht mehr zu den heutigen Punkten/Dörfern)
+    eichMinAnzahl: 30,   // so viele Vergleichsspieler mindestens, sonst feste Formel
+    eichZiel: 200,       // der Median der Vergleichsspieler entspricht dieser Quote in %
+    eichTage: 7,         // Eichung höchstens so alt (danach automatisch neu)
+    eichMin: 25000,      // Plausibilitätsgrenzen für die berechnete Eichung
+    eichMax: 80000,
   };
 
   // ---------------------------------------------------------------- Grundlagen
@@ -50,15 +57,13 @@
   const q = (sel) => document.querySelector('#rz-box ' + sel);
 
   // ---------------------------------------------------------------- Soll-Modell
-  // Idee: Truppen-Bevölkerung ~ 0,6 x Dorfpunkte, davon ~40 % für Raubzüge nutzbar,
-  // ~20 Beute pro Einwohner, im Schnitt ~1,75 Kapazitäten pro Tag => ca. 8 x Dorfpunkte.
-  // Weil Raubzüge zeitlich begrenzt sind, wird das mit einer Sättigungskurve gedeckelt:
-  //   Soll/Dorf/Tag = sollMax * (1 - exp(-Punkte pro Dorf / sollP0))
-  //   1.000-Punkte-Dorf ~ 11.000, 4.000-Punkte-Dorf ~ 31.000, 10.000er ~ 42.000
-  function sollProTag(punkte, doerfer) {
+  // Soll (= 100 %) pro Dorf und Tag = C * (1 - exp(-Punkte pro Dorf / sollP0)):
+  // größere Dörfer schaffen mehr, ab ca. 4.000 Punkten pro Dorf flacht die Kurve ab.
+  // C ist entweder fest (sollMax) oder wird aus der Rekordliste der Welt geeicht (siehe berechneEichung).
+  function sollProTag(punkte, doerfer, C) {
     if (!doerfer || !punkte) return 0;
     const pd = punkte / doerfer;
-    return doerfer * CFG.sollMax * (1 - Math.exp(-pd / CFG.sollP0)) * CFG.sollFaktor;
+    return doerfer * C * (1 - Math.exp(-pd / CFG.sollP0));
   }
 
   // ---------------------------------------------------------------- Daten holen
@@ -129,7 +134,7 @@
       const vorher = werte.size, rvorher = raenge.size;
       rows.forEach((r) => {
         const alt = werte.get(r.id);
-        if (!alt || alt.wert < r.wert) werte.set(r.id, { wert: r.wert, datum: r.datum });
+        if (!alt || alt.wert < r.wert) werte.set(r.id, { wert: r.wert, datum: r.datum, rang: r.rang });
         if (r.rang != null) raenge.add(r.rang);
       });
       const rr = rows.map((r) => r.rang).filter((x) => x != null);
@@ -159,6 +164,38 @@
   const heuteDatum = () => { const t = new Date(); return [t.getDate(), t.getMonth() + 1, t.getFullYear()].map((x, i) => String(x).padStart(i < 2 ? 2 : 4, '0')).join('.'); };
   const istHeute = (datum) => /^heute$/i.test(datum || '') || (datum || '').trim() === heuteDatum();
 
+  // ---------------------------------------------------------------- Welt-Eichung
+  const EKEY = 'rz_eich_' + gd.world;
+  const median = (a) => { const t = [...a].sort((x, y) => x - y); const m = t.length >> 1; return t.length % 2 ? t[m] : (t[m - 1] + t[m]) / 2; };
+  const alterInTagen = (datum) => {
+    const t = (datum || '').trim();
+    if (/^heute$/i.test(t)) return 0;
+    if (/^gestern$/i.test(t)) return 1;
+    const m = t.match(/^(\d{2})\.(\d{2})\.(\d{4})/);
+    if (!m) return null;
+    const h = new Date(); h.setHours(0, 0, 0, 0);
+    return Math.round((h - new Date(+m[3], +m[2] - 1, +m[1])) / 864e5);
+  };
+  // Vergleich mit der Welt: Rekord pro Dorf der Top-100 (nur Rekorde der letzten Tage, damit Punkte/Dörfer noch passen),
+  // geteilt durch die Kurve. Der MEDIAN ist unempfindlich gegen Ausreißer (z. B. Spieler, die viele Dörfer verloren haben).
+  function berechneEichung(raub, players) {
+    const byId = new Map(players.map((p) => [p.id, p]));
+    const werte = [];
+    raub.forEach((e, id) => {
+      if (e.rang == null || e.rang > CFG.eichTop) return;
+      const a = alterInTagen(e.datum);
+      if (a == null || a > CFG.eichMaxAlter) return;
+      const p = byId.get(id);
+      if (!p || !p.doerfer || !p.punkte) return;
+      werte.push(e.wert / p.doerfer / (1 - Math.exp(-(p.punkte / p.doerfer) / CFG.sollP0)));
+    });
+    if (werte.length < CFG.eichMinAnzahl) return null;
+    const c = median(werte) / (CFG.eichZiel / 100);
+    if (!(c >= CFG.eichMin && c <= CFG.eichMax)) return null;
+    return { C: Math.round(c), n: werte.length, t: Date.now() };
+  }
+  const datumKurz = (t) => new Date(t).toLocaleDateString('de-DE');
+
   // ---------------------------------------------------------------- Auswertung
   let ergebnis = null;
   let sort = { k: 'quote', dir: -1 };
@@ -184,6 +221,29 @@
       const plund = await ladeRangliste('in_a_day', CFG.typPlundern, 'Plündern', setStatus, diag);
       const raub = await ladeRangliste('in_a_day', CFG.typRaubzug, 'Raubzüge', setStatus, diag);
 
+      // Messlatte (C): Welt-Eichung (höchstens eichTage alt) oder feste Formel
+      let C = CFG.sollMax;
+      let eichText = `Messlatte: feste Formel (C = ${fmt(C)} je Dorf)`;
+      if (q('input[name=rz-latte]:checked').value === 'welt') {
+        let e = null;
+        try { e = JSON.parse(localStorage.getItem(EKEY)); } catch (x) { e = null; }
+        if (!(e && e.C)) e = null;
+        const frisch = e && (Date.now() - e.t) < CFG.eichTage * 864e5 && !q('#rz-neueichen').checked;
+        let alt = false;
+        if (!frisch) {
+          const neu = berechneEichung(raub, welt.players);
+          if (neu) { e = neu; try { localStorage.setItem(EKEY, JSON.stringify(e)); } catch (x) { /* ignorieren */ } }
+          else if (e) alt = true;
+          else { e = null; hinweise.push('Welt-Eichung nicht möglich (zu wenige junge Rekorde in den Top 100) – feste Formel verwendet.'); }
+        }
+        if (e) {
+          C = e.C;
+          eichText = `Messlatte: Welt-Eichung vom ${datumKurz(e.t)} (C = ${fmt(C)} je Dorf; Median von ${e.n} Top-100-Spielern = ${CFG.eichZiel} %)` +
+            (alt ? ' – Neuberechnung gerade nicht möglich, alte Eichung verwendet' : '');
+        }
+      }
+      hinweise.unshift(eichText);
+
       const jetzt = new Date();
       const stundenHeute = Math.max((jetzt.getHours() * 60 + jetzt.getMinutes()) / 60, 0.25);
       const heute = modus === 'heute';
@@ -197,7 +257,7 @@
       };
       const rows = members.map((p) => {
         const l = wertVon(plund, p.id), r2 = wertVon(raub, p.id);
-        const sollTag = sollProTag(p.punkte, p.doerfer);
+        const sollTag = sollProTag(p.punkte, p.doerfer, C);
         const soll = heute ? sollTag * stundenHeute / 24 : sollTag;
         const r = {
           id: p.id, name: p.name, tag: tagVon[p.ally], punkte: p.punkte, doerfer: p.doerfer,
@@ -216,7 +276,7 @@
       diag[0].treffer = members.filter((p) => plund.has(p.id)).length;
       diag[1].treffer = members.filter((p) => raub.has(p.id)).length;
       diag.forEach((x) => { x.mitglieder = members.length; });
-      ergebnis = { rows, modus, hinweise, diag };
+      ergebnis = { rows, modus, hinweise, diag, eichText };
       zeigeErgebnis();
     } catch (e) {
       console.error(e);
@@ -291,7 +351,7 @@
   }
 
   function diagText() {
-    return (ergebnis.diag || []).map((d) => {
+    return (ergebnis.eichText || '') + '\n' + (ergebnis.diag || []).map((d) => {
       const kopf = `${d.label} (mode=${d.mode}, type=${d.type}): ${d.seiten.length} Seite(n), ${d.gesamt} Spieler, höchster Rang ${d.hoechsterRang}, ` +
         `Treffer im Stamm ${d.treffer}/${d.mitglieder}, Parameter: ${d.param || 'keiner'}`;
       const z = (x) => `  ${x.url} -> Zeilen ${x.zeilen}, neu ${x.neu}, Ränge ${x.rang}`;
@@ -379,6 +439,10 @@
           <textarea id="rz-tags" rows="3" placeholder="z. B. ABC, XYZ"></textarea></p>
         <p><b>3. Zielquote</b> (ab diesem Wert gilt ein Spieler als zufriedenstellend)
           <select id="rz-ziel-setup">${zielOpt.join('')}</select></p>
+        <p><b>4. Messlatte</b> (was 100 % bedeutet)<br>
+          <label><input type="radio" name="rz-latte" value="welt" checked> Welt-Eichung: Median der Top 100 der Rekordliste = ${CFG.eichZiel} % (höchstens alle ${CFG.eichTage} Tage neu berechnet)</label><br>
+          <label><input type="radio" name="rz-latte" value="fest"> Feste Formel</label><br>
+          <label><input type="checkbox" id="rz-neueichen"> Eichung jetzt neu berechnen</label></p>
         <button id="rz-start">Auswerten</button>
         <div id="rz-status" style="margin-top:6px"></div>
       </div>
@@ -389,7 +453,7 @@
         <div id="rz-bbwrap" style="display:none"><textarea id="rz-bb" rows="8" readonly></textarea><button id="rz-copy">In Zwischenablage kopieren</button></div>
         <div id="rz-table"></div>
         <details style="margin-top:8px"><summary>Diagnose (bei Problemen kopieren und mir schicken)</summary><textarea id="rz-diag" rows="9" readonly></textarea></details>
-        <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) wird aus Dörferzahl und Punkten pro Dorf geschätzt (Sättigungsmodell); bei „tagesaktuell“ wird es auf die seit 0 Uhr vergangene Zeit umgerechnet.</p>
+        <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) pro Dorf = C × (1 − e^(−Punkte pro Dorf ÷ ${CFG.sollP0})), mal Dörferzahl. Bei der Welt-Eichung ist C so gewählt, dass der Median der Top 100 (Rekorde der letzten ${CFG.eichMaxAlter} Tage) ${CFG.eichZiel} % ergibt. Bei „tagesaktuell“ wird das Soll auf die seit 0 Uhr vergangene Zeit umgerechnet.</p>
       </div>`;
     document.body.appendChild(box);
     q('.rz-close').onclick = () => (box.style.display = 'none');
