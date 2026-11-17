@@ -26,8 +26,7 @@
 
   const CFG = {
     pauseMs: 250,      // Pause zwischen zwei Seitenaufrufen
-    maxSeiten: 150,    // Sicherheitsgrenze pro Rangliste
-    historieTage: 3,   // so lange werden Messpunkte für "tagesaktuell" gespeichert
+    maxSeiten: 400,    // Sicherheitsgrenze pro Rangliste
     // Ranglisten-Typen (falls die Welt andere Namen nutzt, hier anpassen):
     typPlundern: 'loot_res',  // Rohstoffe durch Farmen von Dörfern
     typRaubzug: 'scavenge',   // Rohstoffe durch Raubzüge
@@ -47,7 +46,7 @@
   const fmt = (n) => (n == null ? '–' : nf.format(Math.round(n)));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const NUM = /^\d{1,3}(\.\d{3})*$/;
+  const NUM = /^(\d+|\d{1,3}(\.\d{3})+)$/;   // "1001" oder "5.222.447"
   const q = (sel) => document.querySelector('#rz-box ' + sel);
 
   // ---------------------------------------------------------------- Soll-Modell
@@ -87,106 +86,78 @@
     return { players, allies };
   }
 
-  function parseRangliste(html, mode, type) {
+  // Liest NUR die Ranglisten-Tabelle (id endet auf "ranking_table"), nicht das Menü links.
+  function parseRangliste(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const rows = [];
-    doc.querySelectorAll('tr').forEach((tr) => {
+    const t = doc.querySelector('table[id$="ranking_table"]');
+    if (!t) return { rows };
+    const kopf = [...(t.querySelector('tr') ? t.querySelector('tr').children : [])].map((c) => c.textContent.trim().toLowerCase());
+    const iW = kopf.findIndex((h) => h.startsWith('punkte'));
+    const iD = kopf.findIndex((h) => h.startsWith('datum'));
+    const zahl = (x) => { const z = String(x || '').replace(/\s/g, ''); return NUM.test(z) ? parseInt(z.replace(/\./g, ''), 10) : null; };
+    t.querySelectorAll('tr').forEach((tr) => {
       const a = tr.querySelector('a[href*="screen=info_player"]');
       if (!a) return;
       const m = (a.getAttribute('href') || '').match(/[?&]id=(\d+)/);
       if (!m) return;
-      const cells = [...tr.querySelectorAll('td')].map((td) => td.textContent.replace(/\s/g, ''));
-      let wert = null;
-      for (let i = cells.length - 1; i >= 0; i--) {
-        if (NUM.test(cells[i])) { wert = parseInt(cells[i].replace(/\./g, ''), 10); break; }
-      }
-      if (wert != null) rows.push({ id: m[1], wert });
+      const cells = [...tr.children].map((td) => td.textContent.trim().replace(/\s+/g, ' '));
+      let wert = iW >= 0 ? zahl(cells[iW]) : null;
+      if (wert == null) for (let i = cells.length - 1; i >= 1; i--) { const z = zahl(cells[i]); if (z != null) { wert = z; break; } }
+      if (wert == null) return;
+      rows.push({ id: m[1], wert, rang: zahl(cells[0]), datum: iD >= 0 ? cells[iD] : '' });
     });
-    const links = [];
-    doc.querySelectorAll('a[href*="screen=ranking"]').forEach((a) => {
-      const h = a.getAttribute('href') || '';
-      if (!h.includes('mode=' + mode) || !h.includes('type=' + type)) return;
-      const fm = h.match(/[?&]from=(\d+)/);
-      if (!fm) return;
-      links.push({ key: +fm[1], url: new URL(h.replace(/&amp;/g, '&'), location.href).href });
-    });
-    return { rows, links };
+    return { rows };
   }
 
+  // Lädt eine "An einem Tag"-Rangliste vollständig: 25 Plätze pro Seite, immer ab dem ersten fehlenden Platz.
+  // Ergebnis: Map Spieler-ID -> { wert, datum }
   async function ladeRangliste(mode, type, label, fortschritt, diag) {
     const basis = `${location.origin}/game.php?village=${gd.village.id}&screen=ranking&mode=${mode}&type=${type}`;
     const werte = new Map();
-    const d = { label, mode, type, seiten: [], pager: false, param: null, gesamt: 0 };
+    const raenge = new Set();
+    const d = { label, mode, type, seiten: [], param: 'offset', gesamt: 0, hoechsterRang: 0 };
     diag.push(d);
     let n = 0;
+    const lueckenlos = () => { let k = 0; while (raenge.has(k + 1)) k++; return k; };
 
-    // Lädt eine Seite, trägt die Werte ein und meldet Zeilen, neue Spieler und Pager-Links zurück
-    async function seite(url) {
+    async function seite(offset) {
+      const url = `${basis}&offset=${offset}`;
       const html = await holeText(url);
       n++;
-      const { rows, links } = parseRangliste(html, mode, type);
-      const vorher = werte.size;
-      rows.forEach((r) => { if (!werte.has(r.id) || werte.get(r.id) < r.wert) werte.set(r.id, r.wert); });
-      const neu = werte.size - vorher;
-      d.seiten.push({ url: url.replace(location.origin, '').replace(/village=\d+&/, ''), zeilen: rows.length, neu, links: links.length });
+      const { rows } = parseRangliste(html);
+      const vorher = werte.size, rvorher = raenge.size;
+      rows.forEach((r) => {
+        const alt = werte.get(r.id);
+        if (!alt || alt.wert < r.wert) werte.set(r.id, { wert: r.wert, datum: r.datum });
+        if (r.rang != null) raenge.add(r.rang);
+      });
+      const rr = rows.map((r) => r.rang).filter((x) => x != null);
+      d.seiten.push({
+        url: url.replace(location.origin, '').replace(/village=\d+&/, ''),
+        zeilen: rows.length, neu: werte.size - vorher, neueRaenge: raenge.size - rvorher,
+        rang: rr.length ? Math.min(...rr) + '-' + Math.max(...rr) : '?',
+      });
       fortschritt(`${label}: Seite ${n} geladen (${werte.size} Spieler)…`);
       await sleep(CFG.pauseMs);
-      return { rows, links, neu };
+      return { rows, neueRaenge: raenge.size - rvorher };
     }
 
-    const erste = await seite(basis);
-    if (!erste.rows.length) throw new Error(`Keine Ranglisten-Zeilen erkannt (${label}). URL: ${basis}`);
-    const schritt = erste.rows.length;
-
-    // a) Pager-Links der Seite verfolgen
-    const queue = [];
-    const gesehen = new Set([0]);
-    const einreihen = (links) => links.forEach((l) => { d.pager = true; if (!gesehen.has(l.key)) { gesehen.add(l.key); queue.push(l); } });
-    einreihen(erste.links);
-    while (queue.length && n < CFG.maxSeiten) {
-      queue.sort((a, b) => a.key - b.key);
-      const { url } = queue.shift();
-      const s2 = await seite(url);
-      einreihen(s2.links);
+    let leer = 0;
+    while (n < CFG.maxSeiten) {
+      const t = await seite(lueckenlos());   // Seite beginnt bei Platz k+1
+      if (n === 1 && !t.rows.length) throw new Error(`Keine Ranglisten-Zeilen erkannt (${label}).`);
+      if (!t.rows.length) break;
+      if (t.neueRaenge === 0) { if (++leer >= 2) break; } else leer = 0;   // hinter dem Listenende liefert das Spiel die letzte Seite erneut
     }
-
-    // b) Keine Pager-Links gefunden: gängige Parameter ausprobieren (Abbruch, sobald eine Seite nichts Neues bringt)
-    if (!d.pager) {
-      const kandidaten = [
-        ['from', (k) => k * schritt],
-        ['offset', (k) => k * schritt],
-        ['page', (k) => k],
-        ['page', (k) => k + 1],
-      ];
-      for (const [p, f] of kandidaten) {
-        const s1 = await seite(`${basis}&${p}=${f(1)}`);
-        if (s1.neu === 0) continue;
-        d.param = p;
-        for (let k = 2; n < CFG.maxSeiten; k++) {
-          const t = await seite(`${basis}&${p}=${f(k)}`);
-          if (t.neu === 0) break;
-        }
-        break;
-      }
-    }
+    if (!raenge.size) throw new Error(`Keine Platznummern erkannt (${label}).`);
     d.gesamt = werte.size;
+    d.hoechsterRang = Math.max(...raenge);
     return werte;
   }
 
-  // ---------------------------------------------------------------- Verlauf (für "tagesaktuell")
-  const HKEY = 'rz_hist_' + gd.world;
-  function ladeHist() { try { return JSON.parse(localStorage.getItem(HKEY)) || {}; } catch (e) { return {}; } }
-  function speichereHist(h) { try { localStorage.setItem(HKEY, JSON.stringify(h)); } catch (e) { /* ignorieren */ } }
-
-  function basisFuer(h, pid, jetzt) {
-    const list = h[pid] || [];
-    const mid = new Date(jetzt); mid.setHours(0, 0, 0, 0);
-    const heute = list.filter((e) => e.t >= mid.getTime());
-    if (heute.length) return { e: heute[0], genau: true };
-    const frueher = list.filter((e) => e.t < mid.getTime());
-    if (frueher.length) return { e: frueher[frueher.length - 1], genau: false };
-    return null;
-  }
+  const heuteDatum = () => { const t = new Date(); return [t.getDate(), t.getMonth() + 1, t.getFullYear()].map((x, i) => String(x).padStart(i < 2 ? 2 : 4, '0')).join('.'); };
+  const istHeute = (datum) => /^heute$/i.test(datum || '') || (datum || '').trim() === heuteDatum();
 
   // ---------------------------------------------------------------- Auswertung
   let ergebnis = null;
@@ -209,49 +180,38 @@
       const members = welt.players.filter((p) => tagVon[p.ally]);
       if (!members.length) throw new Error('Keine Spieler zu den eingegebenen Tags gefunden.');
 
-      const rm = modus === 'rekord' ? 'in_a_day' : 'kill_player';
       const diag = [];
-      const plund = await ladeRangliste(rm, CFG.typPlundern, 'Plündern', setStatus, diag);
-      const raub = await ladeRangliste(rm, CFG.typRaubzug, 'Raubzüge', setStatus, diag);
+      const plund = await ladeRangliste('in_a_day', CFG.typPlundern, 'Plündern', setStatus, diag);
+      const raub = await ladeRangliste('in_a_day', CFG.typRaubzug, 'Raubzüge', setStatus, diag);
 
-      const jetzt = Date.now();
-      const hist = ladeHist();
+      const jetzt = new Date();
+      const stundenHeute = Math.max((jetzt.getHours() * 60 + jetzt.getMinutes()) / 60, 0.25);
+      const heute = modus === 'heute';
+      // Wert eines Spielers: nicht in der Liste = nie etwas erbeutet = 0.
+      // Heute-Modus: nur exakt, wenn der Rekord von heute ist (dann ist Rekord = Wert seit 0 Uhr).
+      const wertVon = (liste, id) => {
+        const e = liste.get(id);
+        if (!e) return { v: 0, datum: '' };
+        if (!heute) return { v: e.wert, datum: e.datum };
+        return istHeute(e.datum) ? { v: e.wert, datum: e.datum } : { v: null, datum: e.datum };
+      };
       const rows = members.map((p) => {
-        const l = plund.get(p.id) || 0;
-        const s = raub.get(p.id) || 0;
+        const l = wertVon(plund, p.id), r2 = wertVon(raub, p.id);
         const sollTag = sollProTag(p.punkte, p.doerfer);
-        const r = { id: p.id, name: p.name, tag: tagVon[p.ally], punkte: p.punkte, doerfer: p.doerfer, plunder: l, raubzug: s, gesamt: l + s, soll: sollTag, quote: null, seit: null };
-        if (modus === 'heute') {
-          const b = basisFuer(hist, p.id, jetzt);
-          if (b) {
-            r.plunder = Math.max(0, l - b.e.l);
-            r.raubzug = Math.max(0, s - b.e.s);
-            r.gesamt = r.plunder + r.raubzug;
-            const std = Math.max((jetzt - b.e.t) / 3600000, 0.25);
-            r.soll = sollTag * std / 24;
-            r.seit = new Date(b.e.t);
-            r.ungenau = !b.genau;
-          } else {
-            r.plunder = null; r.raubzug = null; r.gesamt = null; r.soll = null;
-          }
-        }
-        r.quote = r.soll > 0 && r.raubzug != null ? (r.raubzug / r.soll) * 100 : null;
+        const soll = heute ? sollTag * stundenHeute / 24 : sollTag;
+        const r = {
+          id: p.id, name: p.name, tag: tagVon[p.ally], punkte: p.punkte, doerfer: p.doerfer,
+          plunder: l.v, raubzug: r2.v, gesamt: l.v != null && r2.v != null ? l.v + r2.v : null,
+          soll, datum: r2.datum, quote: null,
+        };
+        r.quote = soll > 0 && r2.v != null ? (r2.v / soll) * 100 : null;
         return r;
       });
 
-      if (modus === 'heute') {
-        // Messpunkt speichern (höchstens alle 10 Minuten je Spieler), alte Einträge entfernen
-        const grenze = jetzt - CFG.historieTage * 86400000;
-        members.forEach((p) => {
-          const list = (hist[p.id] || []).filter((e) => e.t >= grenze);
-          if (!list.length || jetzt - list[list.length - 1].t > 600000) list.push({ t: jetzt, l: plund.get(p.id) || 0, s: raub.get(p.id) || 0 });
-          hist[p.id] = list;
-        });
-        speichereHist(hist);
-        const ohne = rows.filter((r) => r.raubzug == null).length;
-        if (ohne === rows.length) hinweise.push('Erste Messung gespeichert. Starte das Skript später erneut – dann siehst du den Zuwachs seit dieser Messung. Am genauesten wird es, wenn du es einmal früh am Tag (kurz nach 0 Uhr) laufen lässt.');
-        else if (ohne) hinweise.push(`${ohne} Spieler hatten noch keine Basis-Messung (Anzeige "–").`);
-        if (rows.some((r) => r.ungenau)) hinweise.push('Bei Spielern mit Basis von gestern ist der Zeitraum länger als seit 0 Uhr (siehe Spalte "Seit").');
+      if (heute) {
+        const unbekannt = rows.filter((r) => r.raubzug == null).length;
+        hinweise.push('Tagesaktuell: Das Spiel liefert nur den Tagesrekord, keinen Wert "seit 0 Uhr". Exakt sind daher nur Spieler, deren Rekord von heute ist (oder die noch nie etwas erbeutet haben).');
+        if (unbekannt) hinweise.push(`${unbekannt} von ${rows.length} Spielern haben heute keinen neuen Rekord gesetzt: Ihr Tageswert ist nicht ablesbar (Anzeige "–"), er liegt höchstens beim Rekordwert.`);
       }
       diag[0].treffer = members.filter((p) => plund.has(p.id)).length;
       diag[1].treffer = members.filter((p) => raub.has(p.id)).length;
@@ -313,7 +273,7 @@
       : `<b>${ok} von ${bewertet}</b> Spielern erreichen mindestens <b>${ziel} %</b> der Raubzugsquote ` +
         `(Modus: ${heute ? 'tagesaktuell' : 'Rekordwert (Tagesbester)'}).` + (hinweisHtml ? '<br>' + hinweisHtml : '');
     q('#rz-diag').value = diagText();
-    const cols = heute ? [...SPALTEN, { k: 'seit', t: 'Seit' }] : SPALTEN;
+    const cols = heute ? SPALTEN : [...SPALTEN, { k: 'datum', t: 'Raubzug-Rekord am' }];
     let h = '<table class="rz-tab"><thead><tr><th>#</th>' +
       cols.map((c) => `<th data-k="${c.k}" style="cursor:pointer">${c.t}${sort.k === c.k ? (sort.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr></thead><tbody>';
     rows.forEach((r, i) => {
@@ -322,7 +282,7 @@
         `<td class="n">${fmt(r.punkte)}</td><td class="n">${fmt(r.doerfer)}</td>` +
         `<td class="n">${fmt(r.plunder)}</td><td class="n">${fmt(r.raubzug)}</td><td class="n">${fmt(r.gesamt)}</td>` +
         `<td class="n">${fmt(r.soll)}</td><td class="n"><b>${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}</b></td>` +
-        (heute ? `<td>${r.seit ? r.seit.toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–'}</td>` : '') + '</tr>';
+        (heute ? '' : `<td>${esc(r.datum || '–')}</td>`) + '</tr>';
     });
     q('#rz-table').innerHTML = h + '</tbody></table>';
     q('#rz-table').querySelectorAll('th[data-k]').forEach((th) => {
@@ -331,11 +291,13 @@
   }
 
   function diagText() {
-    return (ergebnis.diag || []).map((d) =>
-      `${d.label} (mode=${d.mode}, type=${d.type}): ${d.seiten.length} Seite(n), ${d.gesamt} Spieler eingelesen, ` +
-      `Treffer im Stamm ${d.treffer}/${d.mitglieder}, Pager-Links: ${d.pager ? 'ja' : 'nein'}${d.param ? ', Parameter: ' + d.param : ''}\n` +
-      d.seiten.slice(0, 12).map((x) => `  ${x.url} -> Zeilen ${x.zeilen}, neu ${x.neu}, Links ${x.links}`).join('\n')
-    ).join('\n');
+    return (ergebnis.diag || []).map((d) => {
+      const kopf = `${d.label} (mode=${d.mode}, type=${d.type}): ${d.seiten.length} Seite(n), ${d.gesamt} Spieler, höchster Rang ${d.hoechsterRang}, ` +
+        `Treffer im Stamm ${d.treffer}/${d.mitglieder}, Parameter: ${d.param || 'keiner'}`;
+      const z = (x) => `  ${x.url} -> Zeilen ${x.zeilen}, neu ${x.neu}, Ränge ${x.rang}`;
+      const sp = d.seiten.length > 14 ? [...d.seiten.slice(0, 8), null, ...d.seiten.slice(-4)] : d.seiten;
+      return kopf + '\n' + sp.map((x) => (x ? z(x) : '  …')).join('\n');
+    }).join('\n');
   }
 
   function bbCode() {
@@ -356,11 +318,11 @@
     const z = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
     const nz = (v) => (v == null ? '' : String(Math.round(v)));
     const kopf = ['Rang', 'Spieler', 'Stamm', 'Punkte', 'Doerfer', 'Plundern', 'Raubzuege', 'Gesamt', 'Soll_Raubzug', 'Quote_Prozent'];
-    if (heute) kopf.push('Seit');
+    if (!heute) kopf.push('Raubzug_Rekord_am');
     const lines = [kopf.map(z).join(';')];
     sortiert().forEach((r, i) => {
       const l = [i + 1, r.name, r.tag, nz(r.punkte), nz(r.doerfer), nz(r.plunder), nz(r.raubzug), nz(r.gesamt), nz(r.soll), r.quote == null ? '' : r.quote.toFixed(1).replace('.', ',')];
-      if (heute) l.push(r.seit ? r.seit.toLocaleString('de-DE') : '');
+      if (!heute) l.push(r.datum || '');
       lines.push(l.map(z).join(';'));
     });
     return '\ufeff' + lines.join('\r\n');
@@ -412,7 +374,7 @@
       <div id="rz-setup">
         <p><b>1. Wert wählen</b><br>
           <label><input type="radio" name="rz-modus" value="rekord" checked> Maximalwert (Tagesrekord aus der Rangliste)</label><br>
-          <label><input type="radio" name="rz-modus" value="heute"> Tagesaktuell (Zuwachs seit 0 Uhr bzw. seit der ersten gespeicherten Messung)</label></p>
+          <label><input type="radio" name="rz-modus" value="heute"> Tagesaktuell (0 Uhr bis jetzt; exakt nur für Spieler mit Rekord von heute)</label></p>
         <p><b>2. Stamm-Tags</b> (einer pro Zeile oder mit Komma getrennt)<br>
           <textarea id="rz-tags" rows="3" placeholder="z. B. ABC, XYZ"></textarea></p>
         <p><b>3. Zielquote</b> (ab diesem Wert gilt ein Spieler als zufriedenstellend)
@@ -427,7 +389,7 @@
         <div id="rz-bbwrap" style="display:none"><textarea id="rz-bb" rows="8" readonly></textarea><button id="rz-copy">In Zwischenablage kopieren</button></div>
         <div id="rz-table"></div>
         <details style="margin-top:8px"><summary>Diagnose (bei Problemen kopieren und mir schicken)</summary><textarea id="rz-diag" rows="9" readonly></textarea></details>
-        <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) wird aus Dörferzahl und Punkten pro Dorf geschätzt (Sättigungsmodell); bei „tagesaktuell“ wird es auf den gemessenen Zeitraum umgerechnet.</p>
+        <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) wird aus Dörferzahl und Punkten pro Dorf geschätzt (Sättigungsmodell); bei „tagesaktuell“ wird es auf die seit 0 Uhr vergangene Zeit umgerechnet.</p>
       </div>`;
     document.body.appendChild(box);
     q('.rz-close').onclick = () => (box.style.display = 'none');
