@@ -162,6 +162,14 @@
 
   const heuteDatum = () => { const t = new Date(); return [t.getDate(), t.getMonth() + 1, t.getFullYear()].map((x, i) => String(x).padStart(i < 2 ? 2 : 4, '0')).join('.'); };
   const istHeute = (datum) => /^heute$/i.test(datum || '') || (datum || '').trim() === heuteDatum();
+  // "Heute"/"Gestern" -> echtes Datum (für BB-Code und CSV, die später gelesen werden)
+  const datumAbs = (datum) => {
+    const t = (datum || '').trim();
+    const f = (d) => [d.getDate(), d.getMonth() + 1, d.getFullYear()].map((x, i) => String(x).padStart(i < 2 ? 2 : 4, '0')).join('.');
+    if (/^heute$/i.test(t)) return f(new Date());
+    if (/^gestern$/i.test(t)) { const d = new Date(); d.setDate(d.getDate() - 1); return f(d); }
+    return t || '–';
+  };
 
   // ---------------------------------------------------------------- Welt-Eichung
   const EKEY = 'rz_eich_' + gd.world;
@@ -361,10 +369,10 @@
     const heute = ergebnis.modus === 'heute';
     const rows = sortiert();
     let t = `[b]Raubzug-Auswertung Welt ${gd.world}[/b] – ${heute ? 'tagesaktuell' : 'Rekordwerte (Tagesbester)'}, Zielquote ${ziel} %\n`;
-    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Dörfer[||]Raubzüge[||]Soll[||]Quote[/**]\n';
+    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Punkte[||]Dörfer[||]Raubzüge[||]Rekord am[||]Soll[||]Quote[/**]\n';
     rows.forEach((r, i) => {
       const c = farbe[klasse(r, ziel)];
-      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.doerfer)}[|]${fmt(r.raubzug)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color]\n`;
+      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.punkte)}[|]${fmt(r.doerfer)}[|]${fmt(r.raubzug)}[|]${datumAbs(r.datum)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color]\n`;
     });
     return t + '[/table]';
   }
@@ -378,7 +386,7 @@
     const lines = [kopf.map(z).join(';')];
     sortiert().forEach((r, i) => {
       const l = [i + 1, r.name, r.tag, nz(r.punkte), nz(r.doerfer), nz(r.raubzug), nz(r.soll), r.quote == null ? '' : r.quote.toFixed(1).replace('.', ',')];
-      if (!heute) l.push(r.datum || '');
+      if (!heute) l.push(datumAbs(r.datum));
       lines.push(l.map(z).join(';'));
     });
     return '\ufeff' + lines.join('\r\n');
