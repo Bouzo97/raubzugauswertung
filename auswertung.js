@@ -40,6 +40,7 @@
     eichTage: 7,         // Eichung höchstens so alt (danach automatisch neu)
     eichMin: 25000,      // Plausibilitätsgrenzen für die berechnete Eichung
     eichMax: 80000,
+    histTage: 35,        // so lange werden die Messungen für den Vorher-Vergleich gespeichert
   };
 
   // ---------------------------------------------------------------- Grundlagen
@@ -203,6 +204,24 @@
   }
   const datumKurz = (t) => new Date(t).toLocaleDateString('de-DE');
 
+  // ---------------------------------------------------------------- Altwerte (nur lokal im Browser)
+  // Pro Tag und Modus wird je Spieler [Raubzugwert, Anteil des Tages] gespeichert: { "2026-11-19": { rekord: { p: { id: [wert, anteil] } } } }
+  const HKEY = 'rz_hist_' + gd.world;
+  const tagKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const keyAnzeige = (k) => k.split('-').reverse().join('.');
+  function ladeHist() {
+    try { const h = JSON.parse(localStorage.getItem(HKEY)); return h && typeof h === 'object' ? h : {}; } catch (x) { return {}; }
+  }
+  function speichereHist(h) {
+    const keys = Object.keys(h).sort();
+    while (keys.length > CFG.histTage) delete h[keys.shift()];
+    try { localStorage.setItem(HKEY, JSON.stringify(h)); return true; } catch (x) { return false; }
+  }
+  const vz = (n) => (n > 0 ? '+' : n < 0 ? '−' : '±');
+  const dvText = (r) => (r.dv == null ? '–' : vz(Math.round(r.dv)) + fmt(Math.abs(r.dv)));
+  const dqText = (r) => { if (r.dq == null) return '–'; const n = Math.round(r.dq); return vz(n) + Math.abs(n) + ' PP'; };
+  const dFarbe = (r) => (r.dq == null ? farbe[''] : r.dq >= 0.5 ? farbe['rz-ok'] : r.dq <= -0.5 ? farbe['rz-bad'] : '#666666');
+
   // ---------------------------------------------------------------- Auswertung
   let ergebnis = null;
   let sort = { k: 'quote', dir: -1 };
@@ -274,6 +293,31 @@
         return r;
       });
 
+      // Vergleich mit der letzten Messung eines früheren Tages (gleicher Modus), dann heutige Messung speichern.
+      // Die alte Beute wird mit dem heutigen Soll neu bewertet, damit nur die echte Veränderung zählt
+      // (Eichung und Punkte ändern sich nicht in den Vergleich hinein).
+      const hist = ladeHist();
+      const heuteKey = tagKey(jetzt);
+      const frueher = Object.keys(hist).filter((k) => k < heuteKey && hist[k] && hist[k][modus]).sort().pop();
+      const basis = frueher ? hist[frueher][modus].p : null;
+      const anteilJetzt = heute ? stundenHeute / 24 : 1;
+      const vergleich = { datum: frueher ? keyAnzeige(frueher) : null, besser: 0, gleich: 0, schlechter: 0 };
+      rows.forEach((r) => {
+        r.dv = null; r.dq = null;
+        const o = basis && basis[r.id];
+        if (!o || r.raubzug == null) return;
+        r.dv = r.raubzug - o[0];
+        const sAlt = sollProTag(r.punkte, r.doerfer, C) * o[1];
+        if (sAlt > 0 && r.quote != null) r.dq = r.quote - (o[0] / sAlt) * 100;
+        const d = r.dq != null ? r.dq : null;
+        if (d == null) return;
+        if (d >= 0.5) vergleich.besser++; else if (d <= -0.5) vergleich.schlechter++; else vergleich.gleich++;
+      });
+      const tagSnap = hist[heuteKey] || (hist[heuteKey] = {});
+      const snap = tagSnap[modus] || (tagSnap[modus] = { p: {} });
+      rows.forEach((r) => { if (r.raubzug != null) snap.p[r.id] = [r.raubzug, +anteilJetzt.toFixed(4)]; });
+      if (!speichereHist(hist)) hinweise.push('Altwerte konnten im Browser nicht gespeichert werden (Speicher gesperrt oder voll).');
+
       if (heute) {
         const unbekannt = rows.filter((r) => r.raubzug == null).length;
         hinweise.push('Tagesaktuell: Das Spiel liefert nur den Tagesrekord, keinen Wert "seit 0 Uhr". Exakt sind daher nur Spieler, deren Rekord von heute ist (oder die noch nie etwas erbeutet haben).');
@@ -281,7 +325,7 @@
       }
       diag[0].treffer = members.filter((p) => raub.has(p.id)).length;
       diag.forEach((x) => { x.mitglieder = members.length; });
-      ergebnis = { rows, modus, hinweise, diag, eichText };
+      ergebnis = { rows, modus, hinweise, diag, eichText, vergleich };
       zeigeErgebnis();
     } catch (e) {
       console.error(e);
@@ -297,6 +341,7 @@
     { k: 'punkte', t: 'Punkte', n: 1 }, { k: 'doerfer', t: 'Dörfer', n: 1 },
     { k: 'raubzug', t: 'Raubzüge', n: 1 }, { k: 'soll', t: 'Soll Raubzug', n: 1 },
     { k: 'quote', t: 'Quote', n: 1 },
+    { k: 'dv', t: 'Δ Raubzüge', n: 1 }, { k: 'dq', t: 'Δ Quote', n: 1 },
   ];
 
   function sortiert() {
@@ -332,10 +377,14 @@
     const ok = rows.filter((r) => r.quote != null && r.quote >= ziel).length;
     const bewertet = rows.filter((r) => r.quote != null).length;
     const hinweisHtml = ergebnis.hinweise.length ? '<span style="color:#8a5a00">' + ergebnis.hinweise.map(esc).join('<br>') + '</span>' : '';
+    const v = ergebnis.vergleich;
+    const vergleichHtml = v.datum
+      ? `<b>Vergleich mit der Messung vom ${v.datum}:</b> ${v.besser} verbessert, ${v.gleich} unverändert, ${v.schlechter} schlechter (Δ Quote in Prozentpunkten, PP).`
+      : '<b>Noch kein Vergleichswert:</b> Die heutige Messung ist gespeichert, der Vergleich erscheint ab dem nächsten Tag.';
     q('#rz-summary').innerHTML = (heute && bewertet === 0)
       ? '<b>Noch keine Auswertung möglich.</b><br>' + hinweisHtml
       : `<b>${ok} von ${bewertet}</b> Spielern erreichen mindestens <b>${ziel} %</b> der Raubzugsquote ` +
-        `(Modus: ${heute ? 'tagesaktuell' : 'Rekordwert (Tagesbester)'}).` + (hinweisHtml ? '<br>' + hinweisHtml : '');
+        `(Modus: ${heute ? 'tagesaktuell' : 'Rekordwert (Tagesbester)'}).<br>` + vergleichHtml + (hinweisHtml ? '<br>' + hinweisHtml : '');
     q('#rz-diag').value = diagText();
     const cols = heute ? SPALTEN : [...SPALTEN, { k: 'datum', t: 'Raubzug-Rekord am' }];
     let h = '<table class="rz-tab"><thead><tr><th>#</th>' +
@@ -346,6 +395,7 @@
         `<td class="n">${fmt(r.punkte)}</td><td class="n">${fmt(r.doerfer)}</td>` +
         `<td class="n">${fmt(r.raubzug)}</td>` +
         `<td class="n">${fmt(r.soll)}</td><td class="n"><b>${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}</b></td>` +
+        `<td class="n" style="color:${dFarbe(r)}">${dvText(r)}</td><td class="n" style="color:${dFarbe(r)}"><b>${dqText(r)}</b></td>` +
         (heute ? '' : `<td>${esc(r.datum || '–')}</td>`) + '</tr>';
     });
     q('#rz-table').innerHTML = h + '</tbody></table>';
@@ -369,29 +419,124 @@
     const heute = ergebnis.modus === 'heute';
     const rows = sortiert();
     let t = `[b]Raubzug-Auswertung Welt ${gd.world}[/b] – ${heute ? 'tagesaktuell' : 'Rekordwerte (Tagesbester)'}, Zielquote ${ziel} %\n`;
-    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Punkte[||]Raubzüge[||]Soll[||]Quote[||]Rekord am[/**]\n';
+    t += '[table]\n[**]#[||]Spieler[||]Stamm[||]Punkte[||]Raubzüge[||]Soll[||]Quote[||]Δ Quote[||]Rekord am[/**]\n';
     rows.forEach((r, i) => {
       const c = farbe[klasse(r, ziel)];
       const alt = alterInTagen(r.datum);
       const dc = alt == null ? farbe[''] : alt > 14 ? farbe['rz-bad'] : alt > 7 ? farbe['rz-mid'] : farbe['rz-ok'];   // gleiche Farben wie die Quote: grün bis 7 Tage, gelb/orange über 7, rot über 14
-      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.punkte)}[|]${fmt(r.raubzug)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color][|][color=${dc}]${datumAbs(r.datum)}[/color]\n`;
+      t += `[*]${i + 1}[|][player]${r.name}[/player][|]${r.tag}[|]${fmt(r.punkte)}[|]${fmt(r.raubzug)}[|]${fmt(r.soll)}[|][color=${c}][b]${r.quote == null ? '–' : r.quote.toFixed(0) + ' %'}[/b][/color][|][color=${dFarbe(r)}]${dqText(r)}[/color][|][color=${dc}]${datumAbs(r.datum)}[/color]\n`;
     });
-    return t + '[/table]';
+    t += '[/table]';
+    if (ergebnis.vergleich.datum) t += `\nΔ Quote = Veränderung der Quote in Prozentpunkten (PP) gegenüber der Messung vom ${ergebnis.vergleich.datum}.`;
+    return t;
   }
 
   function csv() {
     const heute = ergebnis.modus === 'heute';
     const z = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
     const nz = (v) => (v == null ? '' : String(Math.round(v)));
-    const kopf = ['Rang', 'Spieler', 'Stamm', 'Punkte', 'Doerfer', 'Raubzuege', 'Soll_Raubzug', 'Quote_Prozent'];
+    const kopf = ['Rang', 'Spieler', 'Stamm', 'Punkte', 'Doerfer', 'Raubzuege', 'Soll_Raubzug', 'Quote_Prozent', 'Delta_Raubzuege', 'Delta_Quote_PP', 'Vergleich_mit'];
     if (!heute) kopf.push('Raubzug_Rekord_am');
     const lines = [kopf.map(z).join(';')];
     sortiert().forEach((r, i) => {
       const l = [i + 1, r.name, r.tag, nz(r.punkte), nz(r.doerfer), nz(r.raubzug), nz(r.soll), r.quote == null ? '' : r.quote.toFixed(1).replace('.', ',')];
+      l.push(r.dv == null ? '' : Math.round(r.dv), r.dq == null ? '' : r.dq.toFixed(1).replace('.', ','), r.dq == null ? '' : ergebnis.vergleich.datum);
       if (!heute) l.push(datumAbs(r.datum));
       lines.push(l.map(z).join(';'));
     });
     return '\ufeff' + lines.join('\r\n');
+  }
+
+  // Tabelle als Bild (PNG) zeichnen, z. B. zum Hochladen oder Einfügen in Discord
+  function bildCanvas() {
+    const ziel = +q('#rz-ziel').value;
+    const heute = ergebnis.modus === 'heute';
+    const rows = sortiert();
+    const cols = [
+      { t: '#', f: (r, i) => String(i + 1), r: 1 },
+      { t: 'Spieler', f: (r) => r.name },
+      { t: 'Stamm', f: (r) => r.tag },
+      { t: 'Punkte', f: (r) => fmt(r.punkte), r: 1 },
+      { t: 'Dörfer', f: (r) => fmt(r.doerfer), r: 1 },
+      { t: 'Raubzüge', f: (r) => fmt(r.raubzug), r: 1 },
+      { t: 'Soll', f: (r) => fmt(r.soll), r: 1 },
+      { t: 'Quote', f: (r) => (r.quote == null ? '–' : r.quote.toFixed(0) + ' %'), r: 1, b: 1 },
+      { t: 'Δ Raubzüge', f: dvText, r: 1, d: 1 },
+      { t: 'Δ Quote', f: dqText, r: 1, b: 1, d: 1 },
+    ];
+    cols.push({ t: 'Rekord am', f: (r) => datumAbs(r.datum), rek: 1 });
+    const S = 2, H = 26, PAD = 10, FONT = '14px Arial, sans-serif', FB = 'bold 14px Arial, sans-serif';
+    const m = document.createElement('canvas').getContext('2d');
+    cols.forEach((c) => {
+      m.font = FB;
+      let w = m.measureText(c.t).width;
+      rows.forEach((r, i) => { m.font = c.b ? FB : FONT; w = Math.max(w, m.measureText(c.f(r, i)).width); });
+      c.w = Math.ceil(w) + PAD * 2;
+    });
+    const breite = cols.reduce((a, c) => a + c.w, 0);
+    const titel = `Raubzug-Auswertung Welt ${gd.world} – ${heute ? 'tagesaktuell' : 'Rekordwerte (Tagesbester)'}, Zielquote ${ziel} %`;
+    const v = ergebnis.vergleich;
+    const unter = (v.datum ? `Δ Quote = Veränderung in Prozentpunkten (PP) gegenüber der Messung vom ${v.datum}` : 'Noch kein Vergleichswert (erste Messung)') +
+      ` · Stand ${new Date().toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' })}`;
+    const kopfH = 34, fussH = 26;
+    const W = Math.max(breite, 420), Ht = kopfH + H * (rows.length + 1) + fussH;
+    const cv = document.createElement('canvas');
+    cv.width = W * S; cv.height = Ht * S;
+    const g = cv.getContext('2d');
+    g.scale(S, S);
+    g.fillStyle = '#f4e4bc'; g.fillRect(0, 0, W, Ht);
+    g.textBaseline = 'middle';
+    g.fillStyle = '#000'; g.font = 'bold 16px Arial, sans-serif'; g.textAlign = 'left';
+    g.fillText(titel, 10, kopfH / 2);
+    const bg = { 'rz-ok': '#d9efd6', 'rz-mid': '#fbe8b8', 'rz-bad': '#f2cccc', '': '#f4e4bc' };
+    // Kopfzeile
+    let y = kopfH;
+    g.fillStyle = '#c1a264'; g.fillRect(0, y, W, H);
+    const zelle = (c, x, text, fett) => {
+      g.font = fett ? FB : FONT;
+      if (c.r) { g.textAlign = 'right'; g.fillText(text, x + c.w - PAD, y + H / 2); }
+      else { g.textAlign = 'left'; g.fillText(text, x + PAD, y + H / 2); }
+    };
+    let x = 0;
+    g.fillStyle = '#000';
+    cols.forEach((c) => { zelle(c, x, c.t, true); x += c.w; });
+    rows.forEach((r, i) => {
+      y = kopfH + H * (i + 1);
+      const kl = klasse(r, ziel);
+      g.fillStyle = bg[kl]; g.fillRect(0, y, W, H);
+      g.fillStyle = '#d8c18a'; g.fillRect(0, y + H - 1, W, 1);
+      x = 0;
+      cols.forEach((c) => {
+        if (c.d) g.fillStyle = dFarbe(r);
+        else if (c.rek) { const a = alterInTagen(r.datum); g.fillStyle = a == null ? '#000' : a > 14 ? farbe['rz-bad'] : a > 7 ? farbe['rz-mid'] : farbe['rz-ok']; }
+        else g.fillStyle = '#000';
+        zelle(c, x, c.f(r, i), c.b);
+        x += c.w;
+      });
+    });
+    g.fillStyle = '#555'; g.font = '11px Arial, sans-serif'; g.textAlign = 'left';
+    g.fillText(unter, 10, Ht - fussH / 2);
+    return cv;
+  }
+  const bildName = () => `raubzug_${gd.world}_${ergebnis.modus}_${new Date().toISOString().slice(0, 10)}.png`;
+  function bildBlob() { return new Promise((res) => bildCanvas().toBlob(res, 'image/png')); }
+  async function bildSpeichern() {
+    const b = await bildBlob();
+    const url = URL.createObjectURL(b);
+    const a = document.createElement('a');
+    a.href = url; a.download = bildName();
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+  async function bildKopieren() {
+    const st = q('#rz-bildstatus');
+    try {
+      if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('nicht unterstützt');
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': bildBlob() })]);
+      st.textContent = 'Bild kopiert – in Discord einfach mit Strg+V einfügen.';
+    } catch (e) {
+      st.textContent = 'Kopieren nicht möglich – bitte „Als Bild speichern“ nutzen.';
+    }
   }
 
   function download(name, text) {
@@ -449,25 +594,31 @@
           <label><input type="radio" name="rz-latte" value="welt" checked> Welt-Eichung: Median der Top 100 der Rekordliste = ${CFG.eichZiel} % (höchstens alle ${CFG.eichTage} Tage neu berechnet)</label><br>
           <label><input type="radio" name="rz-latte" value="fest"> Feste Formel</label><br>
           <label><input type="checkbox" id="rz-neueichen"> Eichung jetzt neu berechnen</label></p>
-        <button id="rz-start">Auswerten</button>
+        <button id="rz-start">Auswerten</button> <button id="rz-histloesch" title="Löscht die im Browser gespeicherten Altwerte für den Vergleich mit dem Vortag">Altwerte löschen</button>
         <div id="rz-status" style="margin-top:6px"></div>
       </div>
       <div id="rz-result" style="display:none">
         <div>Zielquote: <select id="rz-ziel">${zielOpt.join('')}</select>
-          <button id="rz-bbbtn">BB-Code</button><button id="rz-csvbtn">CSV herunterladen</button><button id="rz-neu">Neue Auswertung</button></div>
+          <button id="rz-bbbtn">BB-Code</button><button id="rz-pngbtn" title="Tabelle als Bild, z. B. zum Hochladen in Discord">Als Bild speichern (PNG)</button><button id="rz-pngcopy" title="Bild in die Zwischenablage, dann in Discord mit Strg+V einfügen">Bild kopieren</button><button id="rz-csvbtn">CSV herunterladen</button><button id="rz-neu">Neue Auswertung</button></div>
+        <div id="rz-bildstatus" style="color:#2e5d2e"></div>
         <div id="rz-summary" style="margin:6px 0"></div>
         <div id="rz-bbwrap" style="display:none"><textarea id="rz-bb" rows="8" readonly></textarea><button id="rz-copy">In Zwischenablage kopieren</button></div>
         <div id="rz-table"></div>
         <details style="margin-top:8px"><summary>Diagnose (bei Problemen kopieren und mir schicken)</summary><textarea id="rz-diag" rows="9" readonly></textarea></details>
-        <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) pro Dorf = C × (1 − e^(−Punkte pro Dorf ÷ ${CFG.sollP0})), mal Dörferzahl. Bei der Welt-Eichung ist C so gewählt, dass der Median der Top 100 (Rekorde der letzten ${CFG.eichMaxAlter} Tage) ${CFG.eichZiel} % ergibt. Bei „tagesaktuell“ wird das Soll auf die seit 0 Uhr vergangene Zeit umgerechnet.</p>
+        <p style="margin:8px 0 0;color:#555">Quote = Raubzug-Beute ÷ Soll. Das Soll (100 %) pro Dorf = C × (1 − e^(−Punkte pro Dorf ÷ ${CFG.sollP0})), mal Dörferzahl. Bei der Welt-Eichung ist C so gewählt, dass der Median der Top 100 (Rekorde der letzten ${CFG.eichMaxAlter} Tage) ${CFG.eichZiel} % ergibt. Bei „tagesaktuell“ wird das Soll auf die seit 0 Uhr vergangene Zeit umgerechnet. Δ Quote = Quote jetzt minus Quote der letzten Messung eines früheren Tages (alte Beute mit dem heutigen Soll bewertet), in Prozentpunkten (PP); jede Auswertung speichert die Werte im Browser.</p>
       </div>`;
     document.body.appendChild(box);
     q('.rz-close').onclick = () => (box.style.display = 'none');
     q('#rz-start').onclick = () => { q('#rz-ziel').value = q('#rz-ziel-setup').value; starten(); };
     q('#rz-ziel').onchange = renderTabelle;
+    q('#rz-histloesch').onclick = () => {
+      try { localStorage.removeItem(HKEY); setStatus('Gespeicherte Altwerte gelöscht.'); } catch (x) { setStatus('Löschen nicht möglich.', true); }
+    };
     q('#rz-bbbtn').onclick = () => {
       const w = q('#rz-bbwrap'); w.style.display = 'block'; q('#rz-bb').value = bbCode();
     };
+    q('#rz-pngbtn').onclick = () => { q('#rz-bildstatus').textContent = ''; bildSpeichern(); };
+    q('#rz-pngcopy').onclick = () => { q('#rz-bildstatus').textContent = ''; bildKopieren(); };
     q('#rz-copy').onclick = () => { kopieren(q('#rz-bb').value); };
     q('#rz-csvbtn').onclick = () => download(`raubzug_${gd.world}_${ergebnis.modus}_${new Date().toISOString().slice(0, 10)}.csv`, csv());
     q('#rz-neu').onclick = () => { q('#rz-result').style.display = 'none'; q('#rz-setup').style.display = 'block'; q('#rz-status').textContent = ''; };
